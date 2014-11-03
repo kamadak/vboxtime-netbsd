@@ -1,0 +1,12 @@
+# $NetBSD$
+
+ioconf vboxtime
+
+include "conf/files"
+include "dev/pci/files.pci"
+
+include "./files.vboxtime"
+
+pseudo-root pci*
+
+vboxtime* at pci? dev ? function ?

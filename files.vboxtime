@@ -1,0 +1,6 @@
+# $NetBSD$
+
+device	vboxtime
+attach	vboxtime at pci
+#file	dev/pci/vboxtime.c		vboxtime
+file	vboxtime.c			vboxtime

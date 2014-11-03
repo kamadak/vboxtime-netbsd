@@ -1,0 +1,17 @@
+VirtualBox time synchronization driver for NetBSD 7
+---------------------------------------------------
+
+   The vboxtime driver periodically synchronize the kernel clock
+   with the host.
+
+Build and Install
+-----------------
+
+   Extract the kernel source code into /usr/src/sys.  If it is not there,
+   add S=/path/to/kernel/source/code parameter to make.
+
+   % make
+   # make install
+
+-- 
+KAMADA Ken'ichi
