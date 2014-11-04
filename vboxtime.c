@@ -38,7 +38,8 @@
 
 #include "vboxtime.h"
 
-#define VBOXTIME_SYNC_INTERVAL		1	/* in seconds */
+#define VBOXTIME_SYNC_INTERVAL		60	/* in seconds */
+#define VBOXTIME_STEP_THRESHOLD		5	/* in seconds */
 
 #define VMMDEV_BAR0		(PCI_MAPREG_START + 0)	/* I/O */
 #define VMMDEV_BAR1		(PCI_MAPREG_START + 4)	/* Memory */
@@ -226,6 +227,8 @@ vboxtime_sync(void *arg)
 	VMMDevReqHostTime req;
 	volatile VMMDevReqHostTime *vreq;
 	struct timeval guest, host, delta;
+	struct timespec step;
+	const char *mode;
 
 	vreq = &req;
 	vboxtime_make_req_header(&req.header,
@@ -246,12 +249,22 @@ vboxtime_sync(void *arg)
 	microtime(&guest);
 	host.tv_sec = req.time / 1000;
 	host.tv_usec = req.time % 1000 * 1000;
-	timersub(&guest, &host, &delta);
+	timersub(&host, &guest, &delta);
+	if (delta.tv_sec < VBOXTIME_STEP_THRESHOLD &&
+	    delta.tv_sec >= -VBOXTIME_STEP_THRESHOLD) {
+		mode = "adjust";
+		adjtime1(&delta, NULL, NULL);
+	} else {
+		mode = "step";
+		step.tv_sec = host.tv_sec;
+		step.tv_nsec = host.tv_usec * 1000;
+		(void)settime(NULL, &step);
+	}
 	if (delta.tv_sec >= 0 || delta.tv_usec == 0)
-		aprint_normal_dev(sc->sc_dev, "delta %lld.%06u seconds\n",
+		aprint_verbose_dev(sc->sc_dev, "%s %lld.%06u sec\n", mode,
 		    (long long)delta.tv_sec, (unsigned int)delta.tv_usec);
 	else
-		aprint_normal_dev(sc->sc_dev, "delta -%lld.%06u seconds\n",
+		aprint_verbose_dev(sc->sc_dev, "%s -%lld.%06u sec\n", mode,
 		    (long long)(-delta.tv_sec - 1),
 		    (unsigned int)(1000000 - delta.tv_usec));
 
