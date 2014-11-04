@@ -76,8 +76,8 @@ MODULE(MODULE_CLASS_DRIVER, vboxtime, "pci");
 
 static int vboxtime_init(struct vboxtime_softc *);
 static void vboxtime_sync(void *);
-static void vboxtime_make_req_header(VMMDevRequestHeader *,
-    VMMDevRequestType, uint32_t);
+static int vboxtime_make_req_header(struct vboxtime_softc *, paddr_t *,
+    VMMDevRequestHeader *, VMMDevRequestType, uint32_t);
 
 static int
 vboxtime_match(device_t parent, cfdata_t cf, void *aux)
@@ -183,6 +183,7 @@ vboxtime_init(struct vboxtime_softc *sc)
 	VMMDevMemory_head *vmmdev;
 	VMMDevReportGuestInfo req;
 	volatile VMMDevReportGuestInfo *vreq;
+	paddr_t paddr;
 
 	/*
 	 * Validate the version and size of the MMIO region.
@@ -204,13 +205,14 @@ vboxtime_init(struct vboxtime_softc *sc)
 	 * one (ReportGuestInfo2) for simplicity.
 	 */
 	vreq = &req;
-	vboxtime_make_req_header(&req.header,
-	    VMMDevReq_ReportGuestInfo, sizeof(req));
+	if (vboxtime_make_req_header(sc, &paddr, &req.header,
+	    VMMDevReq_ReportGuestInfo, sizeof(req)) == -1)
+		return -1;
 	req.guest_info.interface_version = VMMDEV_VERSION;
 	req.guest_info.os_type = VBOXOSTYPE_NetBSD;
 
 	bus_space_write_4(sc->sc_iot, sc->sc_ioh, VMMDEV_PORT_OFF_REQUEST,
-	    vtophys((vaddr_t)&req));
+	    paddr);
 	if (vreq->header.rc < VINF_SUCCESS) {
 		aprint_error_dev(sc->sc_dev, "VMMDevReq_ReportGuestInfo: %d\n",
 		    vreq->header.rc);
@@ -226,6 +228,7 @@ vboxtime_sync(void *arg)
 	struct vboxtime_softc *sc = arg;
 	VMMDevReqHostTime req;
 	volatile VMMDevReqHostTime *vreq;
+	paddr_t paddr;
 	struct timeval guest, host, delta;
 	struct timespec step;
 	const char *mode;
@@ -239,16 +242,13 @@ vboxtime_sync(void *arg)
 	}
 
 	vreq = &req;
-	vboxtime_make_req_header(&req.header,
-	    VMMDevReq_GetHostTime, sizeof(req));
+	if (vboxtime_make_req_header(sc, &paddr, &req.header,
+	    VMMDevReq_GetHostTime, sizeof(req)) == -1)
+		return;
 	req.time = UINT64_MAX;
 
-	/*
-	 * XXX vtophys() is not MI.
-	 * XXX How to ensure that req in in the 32-bit space in x86_64?
-	 */
 	bus_space_write_4(sc->sc_iot, sc->sc_ioh, VMMDEV_PORT_OFF_REQUEST,
-	    vtophys((vaddr_t)&req));
+	    paddr);
 	if (vreq->header.rc < VINF_SUCCESS) {
 		aprint_error_dev(sc->sc_dev, "VMMDevReq_GetHostTime: %d\n",
 		    vreq->header.rc);
@@ -280,14 +280,26 @@ fail:
 	callout_schedule(&sc->sc_sync_callout, sc->sc_sync_ticks);
 }
 
-static void
-vboxtime_make_req_header(VMMDevRequestHeader *header,
-    VMMDevRequestType type, uint32_t size)
+static int
+vboxtime_make_req_header(struct vboxtime_softc *sc, paddr_t *pap,
+    VMMDevRequestHeader *header, VMMDevRequestType type, uint32_t size)
 {
+	if (pmap_extract(pmap_kernel(), (vaddr_t)header, pap) == false) {
+		aprint_error_dev(sc->sc_dev, "pmap_extract failed\n");
+		return -1;
+	}
+	/* XXX How to ensure that req is in the 32-bit space on x86_64? */
+	if (*pap > UINT32_MAX - size) {
+		aprint_error_dev(sc->sc_dev, "memory address too high\n");
+		return -1;
+	}
+
 	header->size = size;
 	header->version = VMMDEV_REQUEST_HEADER_VERSION;
 	header->request_type = type;
 	header->rc = VERR_GENERAL_FAILURE;
 	header->reserved1 = 0;
 	header->reserved2 = 0;
+
+	return 0;
 }
