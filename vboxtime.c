@@ -230,6 +230,14 @@ vboxtime_sync(void *arg)
 	struct timespec step;
 	const char *mode;
 
+	/* There seems no harm in adjusting too early, but wasteful. */
+	if (boottime.tv_sec == 0) {
+		aprint_debug_dev(sc->sc_dev,
+		    "waiting for the system time to be initialized\n");
+		callout_schedule(&sc->sc_sync_callout, hz);	/* 1 sec */
+		return;
+	}
+
 	vreq = &req;
 	vboxtime_make_req_header(&req.header,
 	    VMMDevReq_GetHostTime, sizeof(req));
