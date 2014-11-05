@@ -231,7 +231,7 @@ vboxtime_sync(void *arg)
 	paddr_t paddr;
 	struct timeval guest, host, delta;
 	struct timespec step;
-	const char *mode;
+	char deltastr[1 + 20 + 1 + 6 + 1];	/* 64-bit time_t + usec */
 
 	/* There seems no harm in adjusting too early, but wasteful. */
 	if (boottime.tv_sec == 0) {
@@ -258,23 +258,32 @@ vboxtime_sync(void *arg)
 	host.tv_sec = req.time / 1000;
 	host.tv_usec = req.time % 1000 * 1000;
 	timersub(&host, &guest, &delta);
-	if (delta.tv_sec < VBOXTIME_STEP_THRESHOLD &&
+
+	if (delta.tv_sec >= 0 || delta.tv_usec == 0)
+		snprintf(deltastr, sizeof(deltastr), "%lld.%06u",
+		    (long long)delta.tv_sec, (unsigned int)delta.tv_usec);
+	else
+		snprintf(deltastr, sizeof(deltastr), "-%lld.%06u",
+		    (long long)(-delta.tv_sec - 1),
+		    (unsigned int)(1000000 - delta.tv_usec));
+
+	if ((delta.tv_sec == 0 && delta.tv_usec < 3000) ||
+	    (delta.tv_sec == -1 && delta.tv_usec >= 1000000 - 3000)) {
+		/*
+		 * Do not adjust a small offset.  The granularity of the host
+		 * time is 1 ms.  There is jitter in the request latency.
+		 */
+		aprint_debug_dev(sc->sc_dev, "idle %s sec\n", deltastr);
+	} else if (delta.tv_sec < VBOXTIME_STEP_THRESHOLD &&
 	    delta.tv_sec >= -VBOXTIME_STEP_THRESHOLD) {
-		mode = "adjust";
 		adjtime1(&delta, NULL, NULL);
+		aprint_verbose_dev(sc->sc_dev, "adjust %s sec\n", deltastr);
 	} else {
-		mode = "step";
 		step.tv_sec = host.tv_sec;
 		step.tv_nsec = host.tv_usec * 1000;
 		(void)settime(NULL, &step);
+		aprint_verbose_dev(sc->sc_dev, "step %s sec\n", deltastr);
 	}
-	if (delta.tv_sec >= 0 || delta.tv_usec == 0)
-		aprint_verbose_dev(sc->sc_dev, "%s %lld.%06u sec\n", mode,
-		    (long long)delta.tv_sec, (unsigned int)delta.tv_usec);
-	else
-		aprint_verbose_dev(sc->sc_dev, "%s -%lld.%06u sec\n", mode,
-		    (long long)(-delta.tv_sec - 1),
-		    (unsigned int)(1000000 - delta.tv_usec));
 
 fail:
 	callout_schedule(&sc->sc_sync_callout, sc->sc_sync_ticks);
