@@ -4,7 +4,7 @@ ioconf vboxtime
 
 include "conf/files"
 include "dev/pci/files.pci"
-
+#include "arch/x86/pci/files.pci"
 include "./files.vboxtime"
 
 pseudo-root pci*

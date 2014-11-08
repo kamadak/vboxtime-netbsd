@@ -2,5 +2,5 @@
 
 device	vboxtime
 attach	vboxtime at pci
-#file	dev/pci/vboxtime.c		vboxtime
+#file	arch/x86/pci/vboxtime.c		vboxtime
 file	vboxtime.c			vboxtime
