@@ -3,6 +3,7 @@
 KMOD=	vboxtime
 IOCONF=	vboxtime.ioconf
 SRCS=	vboxtime.c
+#MAN=	vboxtime.4
 
 WARNS=	5
 
