@@ -209,7 +209,11 @@ vboxtime_init(struct vboxtime_softc *sc)
 	    VMMDevReq_ReportGuestInfo, sizeof(req)) == -1)
 		return -1;
 	req.guest_info.interface_version = VMMDEV_VERSION;
+#ifdef __x86_64__
+	req.guest_info.os_type = VBOXOSTYPE_NetBSD_x64;
+#else
 	req.guest_info.os_type = VBOXOSTYPE_NetBSD;
+#endif
 
 	bus_space_write_4(sc->sc_iot, sc->sc_ioh, VMMDEV_PORT_OFF_REQUEST,
 	    paddr);
