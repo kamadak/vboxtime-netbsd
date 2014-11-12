@@ -55,6 +55,13 @@ struct vboxtime_softc {
 	bus_space_tag_t		sc_memt;
 	bus_space_handle_t	sc_memh;
 	bus_size_t		sc_memsize;
+	/* PCI DMA mapping for the request buffer. */
+	bus_dma_tag_t		sc_dmat;
+	bus_dma_segment_t	sc_segs;
+	int			sc_nsegs;
+	bus_dmamap_t		sc_dmam;
+	void			*sc_vreq;
+	paddr_t			sc_preq;
 
 	struct callout		sc_sync_callout;
 	int			sc_sync_ticks;
@@ -74,10 +81,12 @@ MODULE(MODULE_CLASS_DRIVER, vboxtime, "pci");
 #include "ioconf.c"
 #endif
 
+static int vboxtime_alloc_req(struct vboxtime_softc *, size_t);
+static void vboxtime_free_req(struct vboxtime_softc *, size_t);
 static int vboxtime_init(struct vboxtime_softc *);
 static void vboxtime_sync(void *);
-static int vboxtime_make_req_header(struct vboxtime_softc *, paddr_t *,
-    VMMDevRequestHeader *, VMMDevRequestType, uint32_t);
+static void vboxtime_request(struct vboxtime_softc *,
+    VMMDevRequestType, uint32_t);
 
 static int
 vboxtime_match(device_t parent, cfdata_t cf, void *aux)
@@ -109,6 +118,7 @@ vboxtime_attach(device_t parent, device_t self, void *aux)
 	aprint_normal(": VirtualBox Guest Service (rev. 0x%02x)\n", rev);
 	aprint_naive("\n");
 
+	sc->sc_dmat = pa->pa_dmat;
 	callout_init(&sc->sc_sync_callout, 0);
 
 	if (rev != 0) {
@@ -127,6 +137,8 @@ vboxtime_attach(device_t parent, device_t self, void *aux)
 		aprint_error_dev(sc->sc_dev, "can't map mem space\n");
 		return;
 	}
+	if (vboxtime_alloc_req(sc, sizeof(VMMDevRequestStorage)) == -1)
+		return;
 
 	if (vboxtime_init(sc) == -1)
 		return;
@@ -140,6 +152,7 @@ vboxtime_detach(device_t self, int flags)
 {
 	struct vboxtime_softc *sc = device_private(self);
 
+	vboxtime_free_req(sc, sizeof(VMMDevRequestStorage));
 	if (sc->sc_iosize != 0)
 		bus_space_unmap(sc->sc_iot, sc->sc_ioh, sc->sc_iosize);
 	if (sc->sc_memsize != 0)
@@ -177,13 +190,84 @@ vboxtime_modcmd(modcmd_t cmd, void *aux)
 }
 
 static int
+vboxtime_alloc_req(struct vboxtime_softc *sc, size_t size)
+{
+	int error;
+
+	/*
+	 * A request to the VMM device is actually not sent by DMA on
+	 * the PCI bus, but the physical address of the request buffer
+	 * must be within the 32-bit address space.
+	 * The "high" address of pci_attach_args->pa_dmat is limited to
+	 * the 32-bit space (see pci_bus_dma{,64}_tag in
+	 * src/sys/arch/x86/pci/pci_machdep.c), so we can (ab)use it.
+	 *
+	 * The nsegs parameter is 1 to allocate a continuous memory region.
+	 */
+	if ((error = bus_dmamem_alloc(sc->sc_dmat, size,
+	    sizeof(uint32_t), PAGE_SIZE, &sc->sc_segs, 1, &sc->sc_nsegs,
+	    BUS_DMA_WAITOK)) != 0) {
+		aprint_error_dev(sc->sc_dev,
+		    "unable to allocate memory, error = %d\n", error);
+		goto fail_alloc;
+	}
+	if ((error = bus_dmamem_map(sc->sc_dmat, &sc->sc_segs, sc->sc_nsegs,
+	    sizeof(uint32_t), &sc->sc_vreq, BUS_DMA_WAITOK)) != 0) {
+		aprint_error_dev(sc->sc_dev,
+		    "unable to map memory, error = %d\n", error);
+		goto fail_map;
+	}
+	if ((error = bus_dmamap_create(sc->sc_dmat, size, 1, size, 0,
+	    BUS_DMA_WAITOK, &sc->sc_dmam)) != 0) {
+		aprint_error_dev(sc->sc_dev,
+		    "unable to create DMA map, error = %d\n", error);
+		goto fail_create;
+	}
+	if ((error = bus_dmamap_load(sc->sc_dmat, sc->sc_dmam,
+	    sc->sc_vreq, size, NULL, BUS_DMA_WAITOK)) != 0) {
+		aprint_error_dev(sc->sc_dev,
+		    "unable to load DMA map, error = %d\n", error);
+		goto fail_load;
+	}
+
+	sc->sc_preq = sc->sc_dmam->dm_segs[0].ds_addr;
+	if (sc->sc_preq > UINT32_MAX - size) {
+		/* This must not happen. */
+		aprint_error_dev(sc->sc_dev, "buffer address too high\n");
+		goto fail;
+	}
+	return 0;
+
+fail:
+	bus_dmamap_unload(sc->sc_dmat, sc->sc_dmam);
+fail_load:
+	bus_dmamap_destroy(sc->sc_dmat, sc->sc_dmam);
+fail_create:
+	bus_dmamem_unmap(sc->sc_dmat, sc->sc_vreq, size);
+fail_map:
+	bus_dmamem_free(sc->sc_dmat, &sc->sc_segs, sc->sc_nsegs);
+fail_alloc:
+	sc->sc_vreq = NULL;
+	return -1;
+}
+
+static void
+vboxtime_free_req(struct vboxtime_softc *sc, size_t size)
+{
+	if (sc->sc_vreq == NULL)
+		return;
+	bus_dmamap_unload(sc->sc_dmat, sc->sc_dmam);
+	bus_dmamap_destroy(sc->sc_dmat, sc->sc_dmam);
+	bus_dmamem_unmap(sc->sc_dmat, sc->sc_vreq, size);
+	bus_dmamem_free(sc->sc_dmat, &sc->sc_segs, sc->sc_nsegs);
+}
+
+static int
 vboxtime_init(struct vboxtime_softc *sc)
 {
 	void *membase;
 	VMMDevMemory_head *vmmdev;
-	VMMDevReportGuestInfo req;
-	volatile VMMDevReportGuestInfo *vreq;
-	paddr_t paddr;
+	VMMDevReportGuestInfo *req;
 
 	/*
 	 * Validate the version and size of the MMIO region.
@@ -204,22 +288,18 @@ vboxtime_init(struct vboxtime_softc *sc)
 	 * The old interface (ReportGuestInfo) is used rather than the new
 	 * one (ReportGuestInfo2) for simplicity.
 	 */
-	vreq = &req;
-	if (vboxtime_make_req_header(sc, &paddr, &req.header,
-	    VMMDevReq_ReportGuestInfo, sizeof(req)) == -1)
-		return -1;
-	req.guest_info.interface_version = VMMDEV_VERSION;
+	req = sc->sc_vreq;
+	req->guest_info.interface_version = VMMDEV_VERSION;
 #ifdef __x86_64__
-	req.guest_info.os_type = VBOXOSTYPE_NetBSD_x64;
+	req->guest_info.os_type = VBOXOSTYPE_NetBSD_x64;
 #else
-	req.guest_info.os_type = VBOXOSTYPE_NetBSD;
+	req->guest_info.os_type = VBOXOSTYPE_NetBSD;
 #endif
 
-	bus_space_write_4(sc->sc_iot, sc->sc_ioh, VMMDEV_PORT_OFF_REQUEST,
-	    paddr);
-	if (vreq->header.rc < VINF_SUCCESS) {
-		aprint_error_dev(sc->sc_dev, "VMMDevReq_ReportGuestInfo: %d\n",
-		    vreq->header.rc);
+	vboxtime_request(sc, VMMDevReq_ReportGuestInfo, sizeof(*req));
+	if (req->header.rc < VINF_SUCCESS) {
+		aprint_error_dev(sc->sc_dev,
+		    "VMMDevReq_ReportGuestInfo: %d\n", req->header.rc);
 		return -1;
 	}
 
@@ -230,9 +310,7 @@ static void
 vboxtime_sync(void *arg)
 {
 	struct vboxtime_softc *sc = arg;
-	VMMDevReqHostTime req;
-	volatile VMMDevReqHostTime *vreq;
-	paddr_t paddr;
+	VMMDevReqHostTime *req;
 	struct timeval guest, host, delta;
 	struct timespec step;
 	char deltastr[1 + 20 + 1 + 6 + 1];	/* 64-bit time_t + usec */
@@ -245,22 +323,18 @@ vboxtime_sync(void *arg)
 		return;
 	}
 
-	vreq = &req;
-	if (vboxtime_make_req_header(sc, &paddr, &req.header,
-	    VMMDevReq_GetHostTime, sizeof(req)) == -1)
-		return;
-	req.time = UINT64_MAX;
+	req = sc->sc_vreq;
+	req->time = UINT64_MAX;
 
-	bus_space_write_4(sc->sc_iot, sc->sc_ioh, VMMDEV_PORT_OFF_REQUEST,
-	    paddr);
-	if (vreq->header.rc < VINF_SUCCESS) {
-		aprint_error_dev(sc->sc_dev, "VMMDevReq_GetHostTime: %d\n",
-		    vreq->header.rc);
+	vboxtime_request(sc, VMMDevReq_GetHostTime, sizeof(*req));
+	if (req->header.rc < VINF_SUCCESS) {
+		aprint_error_dev(sc->sc_dev,
+		    "VMMDevReq_GetHostTime: %d\n", req->header.rc);
 		goto fail;
 	}
 	microtime(&guest);
-	host.tv_sec = req.time / 1000;
-	host.tv_usec = req.time % 1000 * 1000;
+	host.tv_sec = req->time / 1000;
+	host.tv_usec = req->time % 1000 * 1000;
 	timersub(&host, &guest, &delta);
 
 	if (delta.tv_sec >= 0 || delta.tv_usec == 0)
@@ -293,20 +367,13 @@ fail:
 	callout_schedule(&sc->sc_sync_callout, sc->sc_sync_ticks);
 }
 
-static int
-vboxtime_make_req_header(struct vboxtime_softc *sc, paddr_t *pap,
-    VMMDevRequestHeader *header, VMMDevRequestType type, uint32_t size)
+static void
+vboxtime_request(struct vboxtime_softc *sc,
+    VMMDevRequestType type, uint32_t size)
 {
-	if (pmap_extract(pmap_kernel(), (vaddr_t)header, pap) == false) {
-		aprint_error_dev(sc->sc_dev, "pmap_extract failed\n");
-		return -1;
-	}
-	/* XXX How to ensure that req is in the 32-bit space on x86_64? */
-	if (*pap > UINT32_MAX - size) {
-		aprint_error_dev(sc->sc_dev, "memory address too high\n");
-		return -1;
-	}
+	VMMDevRequestHeader *header;
 
+	header = sc->sc_vreq;
 	header->size = size;
 	header->version = VMMDEV_REQUEST_HEADER_VERSION;
 	header->request_type = type;
@@ -314,5 +381,16 @@ vboxtime_make_req_header(struct vboxtime_softc *sc, paddr_t *pap,
 	header->reserved1 = 0;
 	header->reserved2 = 0;
 
-	return 0;
+	/* No DMA/bouncing is actually involved, so skip bus_dmamap_sync(). */
+	bus_space_write_4(sc->sc_iot, sc->sc_ioh, VMMDEV_PORT_OFF_REQUEST,
+	    sc->sc_preq);
+
+	/*
+	 * Instruct the optimizer not to assume the liveness of register
+	 * values, because the request buffer was rewritten by the VMM
+	 * device without the compiler's awareness.
+	 * The standard way to do this is "volatile", but accessing always
+	 * via a volatile pointer is inefficient.
+	 */
+	__insn_barrier();
 }

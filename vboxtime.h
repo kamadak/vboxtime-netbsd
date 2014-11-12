@@ -76,6 +76,11 @@ typedef struct {
 	} guest_info;
 } VMMDevReportGuestInfo;
 
+typedef union {
+	VMMDevReqHostTime req_host_time;
+	VMMDevReportGuestInfo report_host_info;
+} VMMDevRequestStorage;
+
 #define VMMDEV_MEMORY_VERSION		1
 /* This is not the full version of VMMDevMemory. */
 typedef struct {
