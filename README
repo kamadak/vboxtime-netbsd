@@ -1,8 +1,14 @@
-VirtualBox time synchronization driver for NetBSD 7
----------------------------------------------------
+VirtualBox time synchronization driver for NetBSD
+-------------------------------------------------
 
    The vboxtime driver periodically synchronize the kernel clock
    with the host.
+
+Supported Platforms
+-------------------
+
+   Guest: NetBSD/{i386,amd64} 6.x and later
+   Host: VirtualBox 4.x
 
 Build and Install
 -----------------
