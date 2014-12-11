@@ -152,14 +152,14 @@ vboxtime_detach(device_t self, int flags)
 {
 	struct vboxtime_softc *sc = device_private(self);
 
+	callout_halt(&sc->sc_sync_callout, NULL);
+	callout_destroy(&sc->sc_sync_callout);
+
 	vboxtime_free_req(sc, sizeof(VMMDevRequestStorage));
 	if (sc->sc_iosize != 0)
 		bus_space_unmap(sc->sc_iot, sc->sc_ioh, sc->sc_iosize);
 	if (sc->sc_memsize != 0)
 		bus_space_unmap(sc->sc_memt, sc->sc_memh, sc->sc_memsize);
-
-	callout_halt(&sc->sc_sync_callout, NULL);
-	callout_destroy(&sc->sc_sync_callout);
 
 	return 0;
 }
