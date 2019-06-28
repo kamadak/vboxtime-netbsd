@@ -24,7 +24,7 @@
 .\" OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
 .\" SUCH DAMAGE.
 .\"
-.Dd November 17, 2014
+.Dd June 28, 2019
 .Dt VBOXTIME 4
 .Os
 .\" ----------------------------------------------------------------
@@ -46,6 +46,15 @@ The
 driver synchronizes the time every one minute.
 The time is stepped if the offset is larger than 5 seconds,
 and the clock speed is adjusted otherwise.
+.Pp
+The driver is configurable via
+.Xr sysctl 8
+with the nodes under
+.Va hw.vboxtime0
+tree.
+.\" ----------------------------------------------------------------
+.Sh SEE ALSO
+.Xr sysctl 8
 .\" ----------------------------------------------------------------
 .Sh AUTHORS
 The

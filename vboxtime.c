@@ -32,6 +32,7 @@
 #include <sys/device.h>
 #include <sys/kernel.h>
 #include <sys/module.h>
+#include <sys/sysctl.h>
 #include <uvm/uvm_extern.h>
 #include <dev/pci/pcidevs.h>
 #include <dev/pci/pcivar.h>
@@ -62,9 +63,12 @@ struct vboxtime_softc {
 	bus_dmamap_t		sc_dmam;
 	void			*sc_vreq;
 	paddr_t			sc_preq;
-
+	/* sysctl */
+	struct sysctllog	*sc_sysctllog;
+	int			sc_sync_interval;
+	int			sc_step_threshold;
+	/* callout */
 	struct callout		sc_sync_callout;
-	int			sc_sync_ticks;
 };
 
 static int vboxtime_match(device_t, cfdata_t, void *);
@@ -81,6 +85,9 @@ MODULE(MODULE_CLASS_DRIVER, vboxtime, "pci");
 #include "ioconf.c"
 #endif
 
+static int vboxtime_sysctl_create(struct vboxtime_softc *sc);
+static int vboxtime_sysctl_helper_sync_interval(SYSCTLFN_PROTO);
+static int vboxtime_sysctl_helper_step_threshold(SYSCTLFN_PROTO);
 static int vboxtime_alloc_req(struct vboxtime_softc *, size_t);
 static void vboxtime_free_req(struct vboxtime_softc *, size_t);
 static int vboxtime_init(struct vboxtime_softc *);
@@ -140,9 +147,11 @@ vboxtime_attach(device_t parent, device_t self, void *aux)
 	if (vboxtime_alloc_req(sc, sizeof(VMMDevRequestStorage)) == -1)
 		return;
 
+	if (vboxtime_sysctl_create(sc) == -1)
+		return;
+
 	if (vboxtime_init(sc) == -1)
 		return;
-	sc->sc_sync_ticks = mstohz(VBOXTIME_SYNC_INTERVAL * 1000);
 	callout_setfunc(&sc->sc_sync_callout, vboxtime_sync, sc);
 	vboxtime_sync(sc);
 }
@@ -154,6 +163,9 @@ vboxtime_detach(device_t self, int flags)
 
 	callout_halt(&sc->sc_sync_callout, NULL);
 	callout_destroy(&sc->sc_sync_callout);
+
+	if (sc->sc_sysctllog != NULL)
+		sysctl_teardown(&sc->sc_sysctllog);
 
 	vboxtime_free_req(sc, sizeof(VMMDevRequestStorage));
 	if (sc->sc_iosize != 0)
@@ -187,6 +199,90 @@ vboxtime_modcmd(modcmd_t cmd, void *aux)
 	default:
 		return ENOTTY;
 	}
+}
+
+static int
+vboxtime_sysctl_create(struct vboxtime_softc *sc)
+{
+	const struct sysctlnode *node = NULL;
+	int error;
+
+	sc->sc_sysctllog = NULL;
+	sc->sc_sync_interval = VBOXTIME_SYNC_INTERVAL;
+	sc->sc_step_threshold = VBOXTIME_STEP_THRESHOLD;
+
+	error = sysctl_createv(&sc->sc_sysctllog, 0, NULL, &node,
+	    0, CTLTYPE_NODE, device_xname(sc->sc_dev), NULL, NULL, 0, NULL, 0,
+	    CTL_HW, CTL_CREATE, CTL_EOL);
+	if (error != 0 || node == NULL)
+		goto fail;
+
+	error = sysctl_createv(&sc->sc_sysctllog, 0, &node, NULL,
+	    CTLFLAG_OWNDESC | CTLFLAG_READWRITE,
+	    CTLTYPE_INT, "sync_interval",
+	    SYSCTL_DESCR("Synchronization interval in seconds"),
+	    &vboxtime_sysctl_helper_sync_interval, 0, (void *)sc, 0,
+	    CTL_CREATE, CTL_EOL);
+	if (error != 0)
+		goto fail;
+
+	error = sysctl_createv(&sc->sc_sysctllog, 0, &node, NULL,
+	    CTLFLAG_OWNDESC | CTLFLAG_READWRITE,
+	    CTLTYPE_INT, "step_threshold",
+	    SYSCTL_DESCR("Threshold for step adjustment in seconds"),
+	    &vboxtime_sysctl_helper_step_threshold, 0, (void *)sc, 0,
+	    CTL_CREATE, CTL_EOL);
+	if (error != 0)
+		goto fail;
+
+	return 0;
+fail:
+	aprint_error_dev(sc->sc_dev, "cannot create sysctl nodes\n");
+	return -1;
+}
+
+static int
+vboxtime_sysctl_helper_sync_interval(SYSCTLFN_ARGS)
+{
+	struct vboxtime_softc *sc = rnode->sysctl_data;
+	struct sysctlnode node;
+	int t, error;
+
+	t = sc->sc_sync_interval;
+	node = *rnode;
+	node.sysctl_data = &t;
+	error = sysctl_lookup(SYSCTLFN_CALL(&node));
+	if (error || newp == NULL)
+		return error;
+
+	/* Limit the maximum so that "int ticks" does not overflow. */
+	if (t < 1 || t > 86400)
+		return EINVAL;
+	sc->sc_sync_interval = t;
+	/* Reschedule now. */
+	callout_schedule(&sc->sc_sync_callout, sc->sc_sync_interval * hz);
+	return 0;
+}
+
+static int
+vboxtime_sysctl_helper_step_threshold(SYSCTLFN_ARGS)
+{
+	struct vboxtime_softc *sc = rnode->sysctl_data;
+	struct sysctlnode node;
+	int t, error;
+
+	t = sc->sc_step_threshold;
+	node = *rnode;
+	node.sysctl_data = &t;
+	error = sysctl_lookup(SYSCTLFN_CALL(&node));
+	if (error || newp == NULL)
+		return error;
+
+	/* Adjusting a big deviation with adjtime is not sane. */
+	if (t < 0 || t > 3600)
+		return EINVAL;
+	sc->sc_step_threshold = t;
+	return 0;
 }
 
 static int
@@ -352,8 +448,8 @@ vboxtime_sync(void *arg)
 		 * time is 1 ms.  There is jitter in the request latency.
 		 */
 		aprint_debug_dev(sc->sc_dev, "idle %s sec\n", deltastr);
-	} else if (delta.tv_sec < VBOXTIME_STEP_THRESHOLD &&
-	    delta.tv_sec >= -VBOXTIME_STEP_THRESHOLD) {
+	} else if (delta.tv_sec < sc->sc_step_threshold &&
+	    delta.tv_sec >= -sc->sc_step_threshold) {
 		adjtime1(&delta, NULL, NULL);
 		aprint_verbose_dev(sc->sc_dev, "adjust %s sec\n", deltastr);
 	} else {
@@ -364,7 +460,7 @@ vboxtime_sync(void *arg)
 	}
 
 fail:
-	callout_schedule(&sc->sc_sync_callout, sc->sc_sync_ticks);
+	callout_schedule(&sc->sc_sync_callout, sc->sc_sync_interval * hz);
 }
 
 static void
