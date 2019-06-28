@@ -39,6 +39,7 @@
 
 #include "vboxtime.h"
 
+#define VBOXTIME_VERBOSE		1
 #define VBOXTIME_SYNC_INTERVAL		60	/* in seconds */
 #define VBOXTIME_STEP_THRESHOLD		5	/* in seconds */
 
@@ -65,6 +66,7 @@ struct vboxtime_softc {
 	paddr_t			sc_preq;
 	/* sysctl */
 	struct sysctllog	*sc_sysctllog;
+	int			sc_verbose;
 	int			sc_sync_interval;
 	int			sc_step_threshold;
 	/* callout */
@@ -86,6 +88,7 @@ MODULE(MODULE_CLASS_DRIVER, vboxtime, "pci");
 #endif
 
 static int vboxtime_sysctl_create(struct vboxtime_softc *sc);
+static int vboxtime_sysctl_helper_verbose(SYSCTLFN_PROTO);
 static int vboxtime_sysctl_helper_sync_interval(SYSCTLFN_PROTO);
 static int vboxtime_sysctl_helper_step_threshold(SYSCTLFN_PROTO);
 static int vboxtime_alloc_req(struct vboxtime_softc *, size_t);
@@ -94,6 +97,8 @@ static int vboxtime_init(struct vboxtime_softc *);
 static void vboxtime_sync(void *);
 static void vboxtime_request(struct vboxtime_softc *,
     VMMDevRequestType, uint32_t);
+static void vboxtime_print_delta(device_t dev,
+    const char *action, struct timeval delta);
 
 static int
 vboxtime_match(device_t parent, cfdata_t cf, void *aux)
@@ -208,6 +213,7 @@ vboxtime_sysctl_create(struct vboxtime_softc *sc)
 	int error;
 
 	sc->sc_sysctllog = NULL;
+	sc->sc_verbose = VBOXTIME_VERBOSE;
 	sc->sc_sync_interval = VBOXTIME_SYNC_INTERVAL;
 	sc->sc_step_threshold = VBOXTIME_STEP_THRESHOLD;
 
@@ -215,6 +221,15 @@ vboxtime_sysctl_create(struct vboxtime_softc *sc)
 	    0, CTLTYPE_NODE, device_xname(sc->sc_dev), NULL, NULL, 0, NULL, 0,
 	    CTL_HW, CTL_CREATE, CTL_EOL);
 	if (error != 0 || node == NULL)
+		goto fail;
+
+	error = sysctl_createv(&sc->sc_sysctllog, 0, &node, NULL,
+	    CTLFLAG_OWNDESC | CTLFLAG_READWRITE,
+	    CTLTYPE_INT, "verbose",
+	    SYSCTL_DESCR("Verbose level"),
+	    &vboxtime_sysctl_helper_verbose, 0, (void *)sc, 0,
+	    CTL_CREATE, CTL_EOL);
+	if (error != 0)
 		goto fail;
 
 	error = sysctl_createv(&sc->sc_sysctllog, 0, &node, NULL,
@@ -239,6 +254,26 @@ vboxtime_sysctl_create(struct vboxtime_softc *sc)
 fail:
 	aprint_error_dev(sc->sc_dev, "cannot create sysctl nodes\n");
 	return -1;
+}
+
+static int
+vboxtime_sysctl_helper_verbose(SYSCTLFN_ARGS)
+{
+	struct vboxtime_softc *sc = rnode->sysctl_data;
+	struct sysctlnode node;
+	int t, error;
+
+	t = sc->sc_verbose;
+	node = *rnode;
+	node.sysctl_data = &t;
+	error = sysctl_lookup(SYSCTLFN_CALL(&node));
+	if (error || newp == NULL)
+		return error;
+
+	if (t < 0 || t > 3)
+		return EINVAL;
+	sc->sc_verbose = t;
+	return 0;
 }
 
 static int
@@ -409,12 +444,12 @@ vboxtime_sync(void *arg)
 	VMMDevReqHostTime *req;
 	struct timeval guest, host, delta;
 	struct timespec step;
-	char deltastr[1 + 20 + 1 + 6 + 1];	/* 64-bit time_t + usec */
 
 	/* There seems no harm in adjusting too early, but wasteful. */
 	if (boottime.tv_sec == 0) {
-		aprint_debug_dev(sc->sc_dev,
-		    "waiting for the system time to be initialized\n");
+		if (sc->sc_verbose >= 3)
+			device_printf(sc->sc_dev,
+			    "waiting for the system time to be initialized\n");
 		callout_schedule(&sc->sc_sync_callout, hz);	/* 1 sec */
 		return;
 	}
@@ -424,7 +459,7 @@ vboxtime_sync(void *arg)
 
 	vboxtime_request(sc, VMMDevReq_GetHostTime, sizeof(*req));
 	if (req->header.rc < VINF_SUCCESS) {
-		aprint_error_dev(sc->sc_dev,
+		device_printf(sc->sc_dev,
 		    "VMMDevReq_GetHostTime: %d\n", req->header.rc);
 		goto fail;
 	}
@@ -433,30 +468,25 @@ vboxtime_sync(void *arg)
 	host.tv_usec = req->time % 1000 * 1000;
 	timersub(&host, &guest, &delta);
 
-	if (delta.tv_sec >= 0 || delta.tv_usec == 0)
-		snprintf(deltastr, sizeof(deltastr), "%lld.%06u",
-		    (long long)delta.tv_sec, (unsigned int)delta.tv_usec);
-	else
-		snprintf(deltastr, sizeof(deltastr), "-%lld.%06u",
-		    (long long)(-delta.tv_sec - 1),
-		    (unsigned int)(1000000 - delta.tv_usec));
-
 	if ((delta.tv_sec == 0 && delta.tv_usec < 3000) ||
 	    (delta.tv_sec == -1 && delta.tv_usec >= 1000000 - 3000)) {
 		/*
 		 * Do not adjust a small offset.  The granularity of the host
 		 * time is 1 ms.  There is jitter in the request latency.
 		 */
-		aprint_debug_dev(sc->sc_dev, "idle %s sec\n", deltastr);
+		if (sc->sc_verbose >= 3)
+			vboxtime_print_delta(sc->sc_dev, "idle", delta);
 	} else if (delta.tv_sec < sc->sc_step_threshold &&
 	    delta.tv_sec >= -sc->sc_step_threshold) {
 		adjtime1(&delta, NULL, NULL);
-		aprint_verbose_dev(sc->sc_dev, "adjust %s sec\n", deltastr);
+		if (sc->sc_verbose >= 2)
+			vboxtime_print_delta(sc->sc_dev, "adjust", delta);
 	} else {
 		step.tv_sec = host.tv_sec;
 		step.tv_nsec = host.tv_usec * 1000;
 		(void)settime(NULL, &step);
-		aprint_verbose_dev(sc->sc_dev, "step %s sec\n", deltastr);
+		if (sc->sc_verbose >= 1)
+			vboxtime_print_delta(sc->sc_dev, "step", delta);
 	}
 
 fail:
@@ -489,4 +519,18 @@ vboxtime_request(struct vboxtime_softc *sc,
 	 * via a volatile pointer is inefficient.
 	 */
 	__insn_barrier();
+}
+
+static void
+vboxtime_print_delta(device_t dev, const char *action, struct timeval delta)
+{
+	long long sec = delta.tv_sec;
+	unsigned int usec = delta.tv_usec;
+
+	if (sec >= 0 || usec == 0)
+		device_printf(dev, "%s %lld.%06u s\n",
+		    action, sec, usec);
+	else
+		device_printf(dev, "%s -%lld.%06u s\n",
+		    action, -sec - 1, 1000000 - usec);
 }
